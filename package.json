@@ -1,0 +1,15 @@
+{
+  "name": "orbit-cli",
+  "version": "0.1.0",
+  "description": "Universal CLI for Orbit — objects, artifacts, inbox decisions, articles, and agent actions.",
+  "type": "module",
+  "bin": { "orbit": "./src/orbit.mjs" },
+  "files": ["src", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "start": "node src/orbit.mjs",
+    "test": "node --test"
+  },
+  "keywords": ["orbit", "agents", "cli", "objects", "revisions"],
+  "license": "MIT"
+}
