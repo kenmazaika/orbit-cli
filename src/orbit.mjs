@@ -3,8 +3,9 @@
 
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 const VERSION = '0.1.0';
 const CONFIG = process.env.ORBIT_CONFIG || join(homedir(), '.config', 'orbit', 'config.json');
@@ -81,6 +82,11 @@ function print(data, flags) {
   if (data?.object) return print(data.object, flags);
   if (Array.isArray(data)) { for (const row of data) console.log(fmtRow(row)); return; }
   if (data?.objects) return print(data.objects, flags);
+  if (data?.dispatch) return print(data.dispatch, flags);
+  if (data?.dispatches) {
+    for (const d of data.dispatches) console.log(`${d.published_at || '-'}\t${d.status}\t${d.slug}\t${d.title}`);
+    return;
+  }
   if (data?.item) return print(data.item, flags);
   if (data?.items) return print(data.items, flags);
   if (data?.active && data?.outbox) {
@@ -109,9 +115,80 @@ function repeated(flags, key) {
   return raw.flatMap((v) => String(v).split(',')).map((v) => v.trim()).filter(Boolean);
 }
 
+function unquote(value) {
+  const text = String(value || '').trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1).replace(/\\"/g, '"').replace(/\\'/g, "'");
+  }
+  return text;
+}
+
+function listValue(value) {
+  const text = String(value || '').trim();
+  if (!text) return [];
+  if (text.startsWith('[') && text.endsWith(']')) {
+    return text.slice(1, -1).split(',').map(unquote).map((x) => x.trim()).filter(Boolean);
+  }
+  return [unquote(text)];
+}
+
+export function parseFrontmatter(markdown) {
+  const match = String(markdown || '').match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return {};
+  const data = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const field = line.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
+    if (!field) continue;
+    const key = field[1]; const value = field[2];
+    data[key] = ['tags', 'source_urls', 'sources'].includes(key) ? listValue(value) : unquote(value);
+  }
+  return data;
+}
+
+export function markdownUrls(markdown) {
+  return [...new Set((String(markdown || '').match(/https?:\/\/[^\s)>\]"']+/g) || [])
+    .map((url) => url.replace(/[.,;:!?]+$/, '')))];
+}
+
+function slugify(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+function isoDate(value) {
+  if (!value) return undefined;
+  const date = new Date(String(value).length === 10 ? `${value}T00:00:00.000Z` : value);
+  return Number.isNaN(date.valueOf()) ? undefined : date.toISOString();
+}
+
+function dispatchInput(flags, fileArg) {
+  const path = flags.file || fileArg;
+  let content;
+  if (flags.stdin || path === '-') content = readFileSync(0, 'utf8');
+  else if (path) content = readFileSync(path, 'utf8');
+  else content = flags.text || flags.content || '';
+  const fm = parseFrontmatter(content);
+  const title = flags.title || fm.title;
+  const slug = flags.slug || fm.slug || (path && path !== '-' ? basename(path).replace(/\.(md|markdown)$/i, '') : slugify(title));
+  const tags = [...repeated(flags, 'tag'), ...listValue(fm.tags || ''), ...(fm.category ? [fm.category] : [])];
+  const sources = [...repeated(flags, 'source'), ...listValue(fm.source_urls || fm.sources || ''), ...markdownUrls(content)];
+  return {
+    slug, title, content,
+    summary: flags.summary || fm.summary || fm.description || fm.subtitle || '',
+    tags: [...new Set(tags)], source_urls: [...new Set(sources)],
+    author: flags.author || fm.author || 'Ken',
+    published_at: isoDate(flags['published-at'] || fm.published_at || fm.pubDate || fm.date),
+    legacy_path: flags['legacy-path'] !== undefined
+      ? (flags['legacy-path'] === true ? null : flags['legacy-path'])
+      : (path && path !== '-' ? path : null),
+    idempotencyKey: flags['idempotency-key'] || null,
+    source: flags.source === 'import' ? 'import' : 'cli',
+  };
+}
+
 async function main() {
   const { _, flags } = parse(process.argv.slice(2));
-  const [group, cmd, ...rest] = _;
+  const [rawGroup, cmd, ...rest] = _;
+  const group = rawGroup === 'article' ? 'dispatch' : rawGroup;
   const cfg = loadConfig();
 
   if (!group || group === 'help' || flags.help) {
@@ -119,7 +196,8 @@ async function main() {
       '  orbit login --url <base> --token <token>\n  orbit status | config show\n' +
       '  orbit object create|get|list|update|revisions|relations\n' +
       '  orbit artifact create|show|revisions|revise|feedback\n' +
-      '  orbit article create|publish|show|revise|feedback\n' +
+      '  orbit dispatch publish <file>|list|show|revise|archive\n' +
+      '  orbit article ...  (compatibility alias for dispatch)\n' +
       '  orbit inbox send|list|show|respond|close|submit\n' +
       '  orbit actions pending|claim|progress|complete|fail\n' +
       '  orbit watch [--object <id>] [--interval 2]\n' +
@@ -193,24 +271,41 @@ async function main() {
     fail(`unknown artifact command: ${cmd}`, 2);
   }
 
-  if (group === 'article') {
-    if (cmd === 'create') {
-      print(await c.post('/objects', { kind: 'orbit.document', title: flags.title || rest[0], externalId: flags.id, data: { surface: 'article' } }), flags); return 0;
+  if (group === 'dispatch') {
+    if (cmd === 'publish' || cmd === 'create') {
+      const input = dispatchInput(flags, rest[0]);
+      if (!input.title || !input.slug || !input.content) {
+        fail('usage: orbit dispatch publish <file|-> [--title t] [--summary s] [--tag t] [--source url] [--slug s] [--draft]', 2);
+      }
+      const made = await c.post('/dispatches', input);
+      if (flags.draft || cmd === 'create') { print(made, flags); return 0; }
+      const published = await c.post(`/dispatches/${encodeURIComponent(made.dispatch.id)}/publish`, {
+        published_at: input.published_at, published_from: flags['published-from'],
+      });
+      print(published, flags); return 0;
     }
-    if (cmd === 'publish' || cmd === 'revise') {
-      const id = flags.id || rest[0];
-      const state = await c.get(`/objects/${encodeURIComponent(id)}`);
-      print(await c.post(`/objects/${encodeURIComponent(id)}/revisions`, {
-        content: readBody(flags), source: flags.source || 'cli', expectedRevisionId: state.object?.currentRevisionId,
+    if (cmd === 'list') {
+      print(await c.get('/dispatches', { query: {
+        status: flags.status || 'published', limit: flags.limit, offset: flags.offset,
+      } }), flags); return 0;
+    }
+    if (cmd === 'show') {
+      print(await c.get(`/dispatches/${encodeURIComponent(rest[0])}`), flags); return 0;
+    }
+    if (cmd === 'revise') {
+      const id = rest[0];
+      if (!id) fail('usage: orbit dispatch revise <id-or-slug> <file|->', 2);
+      const state = await c.get(`/dispatches/${encodeURIComponent(id)}`);
+      const content = dispatchInput(flags, rest[1]).content;
+      if (!content) fail('dispatch revision content is empty', 2);
+      print(await c.post(`/dispatches/${encodeURIComponent(id)}/revisions`, {
+        content, source: flags.source || 'cli', expectedRevisionId: flags['expected-revision'] || state.dispatch.currentRevisionId,
       }), flags); return 0;
     }
-    if (cmd === 'show') { print(await c.get(`/objects/${encodeURIComponent(rest[0])}`), flags); return 0; }
-    if (cmd === 'feedback') {
-      print(await c.post(`/artifacts/${encodeURIComponent(rest[0])}/feedback`, {
-        text: flags.text || readBody(flags), idempotencyKey: flags['idempotency-key'] || `cli-${Date.now()}`,
-      }), flags); return 0;
+    if (cmd === 'archive') {
+      print(await c.post(`/dispatches/${encodeURIComponent(rest[0])}/archive`, {}), flags); return 0;
     }
-    fail(`unknown article command: ${cmd}`, 2);
+    fail(`unknown dispatch command: ${cmd}`, 2);
   }
 
   if (group === 'inbox') {
@@ -276,12 +371,11 @@ async function main() {
       const q = await c.get('/agent/actions');
       const pending = q.requests?.length || 0;
       const { status = 'unknown' } = {}; // service state is adapter-specific
-      console.log(JSON.stringify({ ok: true, pending, transport: 'poll', intervalSeconds: 2, service: process.env.ORBIT_BRIDGE_SERVICE || 'orbit-bridge.service', state: status }, null, 2));
+      console.log(JSON.stringify({ ok: true, pending, transport: 'poll', intervalSeconds: 2, service: 'orbit-artifact-bridge.service', state: status }, null, 2));
       return 0;
     }
     if (cmd === 'run') {
-      const script = flags.script || process.env.ORBIT_BRIDGE_SCRIPT;
-      if (!script) fail('set ORBIT_BRIDGE_SCRIPT or pass --script <adapter.mjs> (bridge execution is an adapter)', 2);
+      const script = flags.script || join(homedir(), 'orbit-blog', 'poc', 'artifact-review', 'orbit-artifact-agent.mjs');
       const child = spawn(process.execPath, [script], { stdio: 'inherit', env: { ...process.env, ORBIT_BASE: cfg.baseUrl, ORBIT_ARTIFACT_BRIDGE_TOKEN: cfg.token } });
       child.on('exit', (code) => process.exit(code ?? 1));
       return 0;
@@ -292,7 +386,9 @@ async function main() {
   fail(`unknown command: ${group} ${cmd || ''}`, 2);
 }
 
-main().catch((e) => {
-  if (e.status === 401) fail('unauthorized — check your token (orbit login)', 3);
-  fail(e.message || String(e), 1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => {
+    if (e.status === 401) fail('unauthorized — check your token (orbit login)', 3);
+    fail(e.message || String(e), 1);
+  });
+}
